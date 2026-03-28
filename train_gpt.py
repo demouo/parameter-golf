@@ -1581,12 +1581,13 @@ def main() -> None:
 
     # Legal TTT evaluation
     if args.ttt_enabled:
+        ttt_stride = args.eval_stride if args.eval_stride > 0 else 64
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_loss, ttt_bpb = eval_val_sliding_ttt(
             args, base_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, log0=log0,
+            stride=ttt_stride, log0=log0,
         )
         torch.cuda.synchronize()
         log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
