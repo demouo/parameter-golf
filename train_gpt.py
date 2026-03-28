@@ -52,7 +52,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 2000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -86,8 +86,10 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
 # -----------------------------
@@ -1151,6 +1153,10 @@ def main() -> None:
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
 
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_enabled:
+        ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1220,8 +1226,15 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # EMA: exponential moving average of model weights
+        if ema_state is not None:
+            d = args.ema_decay
+            with torch.no_grad():
+                for name, t in base_model.state_dict().items():
+                    ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
+
         # SWA: accumulate model weights during warmdown phase
-        if args.swa_enabled and scale < 0.5 and step % args.swa_every == 0:
+        if args.swa_enabled and not args.ema_enabled and scale < 0.5 and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
@@ -1257,8 +1270,14 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if available
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
+    # Apply EMA or SWA if available
+    if ema_state is not None:
+        log0("ema:applying EMA weights")
+        avg_state = {name: t.to(dtype=base_model.state_dict()[name].dtype)
+                     for name, t in ema_state.items()}
+        del ema_state
+        base_model.load_state_dict(avg_state, strict=True)
+    elif args.swa_enabled and swa_state is not None and swa_count > 1:
         log0(f"swa:applying averaged {swa_count} checkpoints")
         avg_state = {name: (t / swa_count).to(dtype=base_model.state_dict()[name].dtype)
                      for name, t in swa_state.items()}
