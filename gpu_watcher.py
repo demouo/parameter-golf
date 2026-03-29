@@ -351,19 +351,14 @@ def main() -> None:
                 print(f"[watcher]   commit    : {queued_commit}")
                 print(f"[watcher]   run script: {current_state.get('run_script')}")
 
-                # Pull latest code
-                print("[watcher] Running git pull...")
-                pulled = git_pull(repo)
-                if not pulled:
-                    print("[watcher] git pull failed — marking as failed")
-                    write_state(repo, {
-                        **current_state,
-                        "state": "failed",
-                        "finished_at": _utcnow_iso(),
-                        "error": "git_pull_failed",
-                    })
-                    time.sleep(args.poll_interval)
-                    continue
+                # Shared filesystem mode: skip git pull, just verify commit matches
+                head_commit = get_current_commit(repo)
+                if queued_commit and head_commit and queued_commit != head_commit:
+                    print(
+                        f"[watcher] WARNING: state commit={queued_commit} != HEAD={head_commit}. "
+                        "Proceeding with HEAD."
+                    )
+                print(f"[watcher] Shared filesystem — HEAD={head_commit}, skipping git pull")
 
                 # Verify run script exists and is executable
                 script_path = repo / RUN_SCRIPT
@@ -377,14 +372,6 @@ def main() -> None:
                     })
                     time.sleep(args.poll_interval)
                     continue
-
-                # Verify the commit in the state file matches HEAD (after pull)
-                head_commit = get_current_commit(repo)
-                if queued_commit and head_commit and queued_commit != head_commit:
-                    print(
-                        f"[watcher] WARNING: state commit={queued_commit} != HEAD={head_commit}. "
-                        "Proceeding with HEAD."
-                    )
 
                 # Run the experiment (blocks until done)
                 run_experiment(repo, script_path, {**current_state, "commit": head_commit or queued_commit})
