@@ -747,16 +747,15 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        if cat in int6_cats and t.ndim >= 1:
+        # Use int6 for all large float tensors (MLP, attn, embed)
+        if t.is_floating_point() and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
         else:
-            q, s = quantize_float_tensor(t)
-            result[name + ".q"] = q
-            result[name + ".scale"] = s
-            meta[name] = {"type": "int8"}
+            result[name] = t
+            meta[name] = "passthrough"
     return result, meta
 
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
