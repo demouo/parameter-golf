@@ -86,6 +86,7 @@ class Hyperparameters:
     leaky_slope = float(os.environ.get("LEAKY_SLOPE", 0.5))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.1))
+    qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.0))  # 0=disabled, e.g. 0.5 = start QAT when lr_scale < 0.5
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -870,9 +871,20 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    _qat_enabled: bool = False
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            # STE fake int6 quantization: forward uses quantized, backward uses original
+            with torch.no_grad():
+                w32 = self.weight.float()
+                row_max = w32.abs().amax(dim=1)
+                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+            w = w + (w_q - w).detach()  # STE: gradient flows through as if w_q = w
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1472,6 +1484,13 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # Enable QAT when lr drops below threshold
+        if args.qat_threshold > 0.0 and scale < args.qat_threshold and not CastedLinear._qat_enabled:
+            CastedLinear._qat_enabled = True
+            if master_process:
+                log0(f"qat:enabled at step={step} lr_scale={scale:.4f} threshold={args.qat_threshold}")
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
