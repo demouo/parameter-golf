@@ -747,15 +747,16 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        # Use int6 for all large float tensors (MLP, attn, embed)
-        if t.is_floating_point() and t.ndim >= 1:
+        if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
         else:
-            result[name] = t
-            meta[name] = "passthrough"
+            q, s = quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
     return result, meta
 
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
@@ -1528,6 +1529,30 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+
+    # Magnitude pruning: zero out smallest quantized values to improve compression
+    prune_frac = float(os.environ.get("PRUNE_FRAC", "0.0"))
+    if prune_frac > 0.0:
+        all_abs = []
+        prune_keys = []
+        for k, v in quant_result.items():
+            if k.endswith(".q") and v.dtype == torch.int8:
+                all_abs.append(v.abs().flatten().float())
+                prune_keys.append(k)
+        if all_abs:
+            all_abs_cat = torch.cat(all_abs)
+            threshold = torch.quantile(all_abs_cat, prune_frac).item()
+            total_pruned = 0
+            total_params = 0
+            for k in prune_keys:
+                q = quant_result[k]
+                mask = q.abs() <= int(threshold)
+                total_pruned += mask.sum().item()
+                total_params += q.numel()
+                q[mask] = 0
+            if master_process:
+                log0(f"pruning: zeroed {total_pruned}/{total_params} ({100*total_pruned/total_params:.1f}%) values at threshold={threshold}")
+
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
