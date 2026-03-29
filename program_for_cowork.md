@@ -81,18 +81,9 @@ To set up a new experiment session, work with the user to:
    python3 gpu_watcher.py --repo-dir /path/to/shared/repo --poll-interval 5
    ```
 6. **Initialize results.tsv**: Create `results.tsv` with header row.
-7. **Initialize state**: Ensure `.gpu_state.json` is in `idle` state. If it doesn't exist, create it:
+7. **Initialize state**: Ensure `.gpu_state.json` is in `idle` state. If it doesn't exist or needs reset:
    ```bash
-   python3 -c "
-   import json, pathlib, datetime
-   pathlib.Path('.gpu_state.json').write_text(json.dumps({
-     'state': 'idle', 'commit': None, 'run_script': None,
-     'pid': None, 'started_at': None, 'finished_at': None,
-     'exit_code': None, 'error': None,
-     'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-   }, indent=2) + '\n')
-   print('Created .gpu_state.json (idle)')
-   "
+   python3 reset_idle.py
    ```
 8. **Run baseline**: Run the training script once with default hyperparameters to establish YOUR baseline (follow the experiment submission procedure below).
 9. **Confirm and go**: Confirm setup looks good.
@@ -140,32 +131,13 @@ chmod +x remote_gpu_run.sh
 
 ### Step 3 — Set state to `pending`
 
-This is the signal that triggers the remote watcher:
+This is the signal that triggers the remote watcher. Use the helper script:
 
 ```bash
-python3 -c "
-import json, pathlib, datetime
-
-commit = '$(git rev-parse --short=7 HEAD)'
-now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-
-state = {
-  'state': 'pending',
-  'commit': commit,
-  'run_script': 'remote_gpu_run.sh',
-  'pid': None,
-  'started_at': None,
-  'finished_at': None,
-  'exit_code': None,
-  'error': None,
-  'updated_at': now,
-}
-tmp = pathlib.Path('.gpu_state.json.tmp')
-tmp.write_text(json.dumps(state, indent=2) + '\n')
-tmp.replace('.gpu_state.json')
-print(f'State → pending  (commit={commit})')
-"
+python3 set_pending.py
 ```
+
+This reads the current HEAD commit and writes `.gpu_state.json` with `state=pending`.
 
 ### Step 4 — Block until experiment finishes
 
@@ -195,19 +167,7 @@ tail -n 50 run.log
 Always do this after reading results, so the next experiment can be submitted:
 
 ```bash
-python3 -c "
-import json, pathlib, datetime
-now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
-state = {
-  'state': 'idle', 'commit': None, 'run_script': None,
-  'pid': None, 'started_at': None, 'finished_at': None,
-  'exit_code': None, 'error': None, 'updated_at': now,
-}
-tmp = pathlib.Path('.gpu_state.json.tmp')
-tmp.write_text(json.dumps(state, indent=2) + '\n')
-tmp.replace('.gpu_state.json')
-print('State → idle')
-"
+python3 reset_idle.py
 ```
 
 ---
