@@ -1537,16 +1537,18 @@ def main() -> None:
         prune_keys = []
         for k, v in quant_result.items():
             if k.endswith(".q") and v.dtype == torch.int8:
-                all_abs.append(v.abs().flatten().float())
+                all_abs.append(v.abs().flatten())
                 prune_keys.append(k)
         if all_abs:
             all_abs_cat = torch.cat(all_abs)
-            threshold = torch.quantile(all_abs_cat, prune_frac).item()
+            # Use kthvalue instead of quantile (handles large tensors)
+            k_idx = max(1, int(prune_frac * all_abs_cat.numel()))
+            threshold = all_abs_cat.to(torch.int16).kthvalue(k_idx).values.item()
             total_pruned = 0
             total_params = 0
             for k in prune_keys:
                 q = quant_result[k]
-                mask = q.abs() <= int(threshold)
+                mask = q.abs() <= threshold
                 total_pruned += mask.sum().item()
                 total_params += q.numel()
                 q[mask] = 0
