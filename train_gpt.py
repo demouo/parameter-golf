@@ -131,6 +131,7 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     sqrt_warmdown = bool(int(os.environ.get("SQRT_WARMDOWN", "0")))  # sqrt decay holds LR higher longer
+    cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "0")))  # cosine annealing warmdown
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1485,6 +1486,8 @@ def main() -> None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             if warmdown_start <= step < args.iterations:
                 frac = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+                if args.cosine_warmdown:
+                    return 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
                 return math.sqrt(frac) if args.sqrt_warmdown else frac
             return 1.0
         step_ms = elapsed_ms / max(step, 1)
@@ -1492,6 +1495,8 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         if remaining_ms <= warmdown_ms:
             frac = remaining_ms / max(warmdown_ms, 1e-9)
+            if args.cosine_warmdown:
+                return 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
             return math.sqrt(frac) if args.sqrt_warmdown else frac
         return 1.0
 
