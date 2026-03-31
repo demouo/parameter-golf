@@ -132,6 +132,7 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     sqrt_warmdown = bool(int(os.environ.get("SQRT_WARMDOWN", "0")))  # sqrt decay holds LR higher longer
     cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "0")))  # cosine annealing warmdown
+    vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))  # Value Residual Learning
 
 # -----------------------------
 # MUON OPTIMIZER 
