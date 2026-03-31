@@ -1700,7 +1700,9 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    int6_cats_str = os.environ.get("INT6_CATS", "mlp,attn")
+    int6_cats = set(int6_cats_str.split(",")) if int6_cats_str else set()
+    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, int6_cats)
 
     # Magnitude pruning: zero out smallest quantized values to improve compression
     prune_frac = float(os.environ.get("PRUNE_FRAC", "0.0"))
