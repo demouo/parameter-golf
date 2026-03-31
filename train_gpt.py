@@ -132,6 +132,7 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     sqrt_warmdown = bool(int(os.environ.get("SQRT_WARMDOWN", "0")))  # sqrt decay holds LR higher longer
     cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "0")))  # cosine annealing warmdown
+    lr_floor = float(os.environ.get("LR_FLOOR", 0.0))  # minimum LR fraction during warmdown
     vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))  # Value Residual Learning
     ortho_init = bool(int(os.environ.get("ORTHO_INIT", "1")))  # orthogonal init for linear layers
 
@@ -1499,8 +1500,12 @@ def main() -> None:
         if remaining_ms <= warmdown_ms:
             frac = remaining_ms / max(warmdown_ms, 1e-9)
             if args.cosine_warmdown:
-                return 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
-            return math.sqrt(frac) if args.sqrt_warmdown else frac
+                raw = 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
+            elif args.sqrt_warmdown:
+                raw = math.sqrt(frac)
+            else:
+                raw = frac
+            return max(raw, args.lr_floor)
         return 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
