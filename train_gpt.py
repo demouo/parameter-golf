@@ -1254,6 +1254,12 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
+        # Z-loss: penalize logit magnitude to improve training stability
+        _z_loss_weight = float(os.environ.get("Z_LOSS_WEIGHT", "0.0"))
+        if self.training and _z_loss_weight > 0.0:
+            z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+            main_loss = main_loss + _z_loss_weight * z_loss
+
         # MTP: auxiliary multi-token prediction loss (discarded at export)
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
