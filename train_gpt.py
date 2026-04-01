@@ -159,7 +159,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
-    return X.T if transposed else X
+    if transposed:
+        X = X.T
+    # Post-NS row/col normalization (Turbo-Muon style)
+    X = X / (X.norm(dim=-1, keepdim=True) + eps)
+    X = X / (X.norm(dim=-2, keepdim=True) + eps)
+    return X
 
 
 class Muon(torch.optim.Optimizer):
