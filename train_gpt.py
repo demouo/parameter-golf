@@ -31,6 +31,15 @@ except ImportError:
 # Prefer LZMA for best compression ratio
 _USE_LZMA = bool(int(os.environ.get("USE_LZMA", "0")))
 
+# Brotli gives ~6% better compression than LZMA (from PR #1105)
+_USE_BROTLI = bool(int(os.environ.get("USE_BROTLI", "0")))
+try:
+    import brotli as _brotli_mod
+except ImportError:
+    _brotli_mod = None
+    if _USE_BROTLI:
+        _USE_BROTLI = False
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -80,6 +89,13 @@ class Hyperparameters:
     mlp_mult = float(os.environ.get("MLP_MULT", 3.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))  # 0 = full RoPE; e.g. 16 = partial RoPE on first 16 dims
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))  # 1/sqrt(layer+1) scaling on sublayer inputs
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))  # XSA on last N layers (0 = disabled)
+    smear_gate = bool(int(os.environ.get("SMEAR_GATE", "0")))  # causal shift gate in GPT forward
+    vrl_mix = float(os.environ.get("VRL_MIX", 0.5))  # VRL mixing ratio (0=no VRL, 1=all first-layer V)
+    use_clamp_softcap = bool(int(os.environ.get("CLAMP_SOFTCAP", "0")))  # clamp instead of tanh
+    parallel_block = bool(int(os.environ.get("PARALLEL_BLOCK", "0")))  # parallel attn+mlp
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -117,6 +133,11 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    sqrt_warmdown = bool(int(os.environ.get("SQRT_WARMDOWN", "0")))  # sqrt decay holds LR higher longer
+    cosine_warmdown = bool(int(os.environ.get("COSINE_WARMDOWN", "0")))  # cosine annealing warmdown
+    lr_floor = float(os.environ.get("LR_FLOOR", 0.0))  # minimum LR fraction during warmdown
+    vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))  # Value Residual Learning
+    ortho_init = bool(int(os.environ.get("ORTHO_INIT", "1")))  # orthogonal init for linear layers
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -715,10 +736,13 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
+_QUANT_BITS = int(os.environ.get("QUANT_BITS", "6"))  # 6=int6 (range 31), 7=int7 (range 63)
+_QUANT_CLIP_RANGE = (1 << (_QUANT_BITS - 1)) - 1  # 6→31, 7→63, 8→127
+
 def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     """GPTQ-lite: search over clip percentiles to minimize reconstruction error."""
     t32 = t.float()
-    clip_range = 31
+    clip_range = _QUANT_CLIP_RANGE
     if t32.ndim == 2:
         best_q, best_s, best_err = None, None, float('inf')
         for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
@@ -881,12 +905,13 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            # STE fake int6 quantization: forward uses quantized, backward uses original
+            # STE fake quantization: forward uses quantized, backward uses original
+            _cr = _QUANT_CLIP_RANGE
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                scale = (row_max / _cr).clamp_min(1.0 / _cr)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -(_cr+1), _cr) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()  # STE: gradient flows through as if w_q = w
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -902,9 +927,10 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.rope_dims = rope_dims if rope_dims > 0 else dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -925,7 +951,13 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
+    if rope_dims > 0 and rope_dims < x.size(-1):
+        x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
+        half = rope_dims // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rope = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rope, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -939,6 +971,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -950,6 +983,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = rope_dims
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -957,7 +991,19 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
+        self.use_xsa = False  # set by GPT.__init__
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        """Efficient XSA: subtract self-value projection via GQA-aware reshape.
+        y: [B, H, T, D], v: [B, Hkv, T, D]. H must be divisible by Hkv."""
+        B, H, T, D = y.shape
+        Hkv = v.size(1)
+        group = H // Hkv
+        y_g = y.reshape(B, Hkv, group, T, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(2)  # [B, Hkv, 1, T, D]
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, H, T, D)
 
     def forward(self, x: Tensor, v_residual: Tensor | None = None) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
@@ -967,12 +1013,13 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         # VRL: mix first-layer V into current V
         if v_residual is not None:
-            v = 0.5 * v + 0.5 * v_residual
+            _vrl_mix = float(os.environ.get("VRL_MIX", 0.5))
+            v = (1.0 - _vrl_mix) * v + _vrl_mix * v_residual
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -981,6 +1028,9 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # XSA: subtract self-value projection to encourage cross-position information
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y), v
 
@@ -989,15 +1039,39 @@ class MLP(nn.Module):
     # leaky relu^2 MLP — leaky relu allows negative signal to pass through
     def __init__(self, dim: int, mlp_mult: float, leaky_slope: float = 0.5):
         super().__init__()
-        hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.gated = bool(int(os.environ.get("GATED_MLP", "0")))
+        if self.gated:
+            hidden = int(mlp_mult * dim)
+            # SwiGLU-style: gate and up in one matrix, half each
+            self.fc = CastedLinear(dim, hidden * 2, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
+        else:
+            hidden = int(mlp_mult * dim)
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
         self.leaky_slope = leaky_slope
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.gated:
+            h = self.fc(x)
+            gate, up = h.chunk(2, dim=-1)
+            x = F.silu(gate) * up
+            return self.proj(x)
         x = F.leaky_relu(self.fc(x), negative_slope=self.leaky_slope)
         return self.proj(x.square())
+
+
+class SmearGate(nn.Module):
+    """Causal shift gate: mix each position with its predecessor."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
 
 
 class BigramHashEmbedding(nn.Module):
@@ -1037,22 +1111,35 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         leaky_slope: float = 0.5,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult, leaky_slope=leaky_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor, v_residual: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, v_out = self.attn(self.attn_norm(x), v_residual=v_residual)
+        normed = self.attn_norm(x) * self.ln_scale_factor
+        attn_out, v_out = self.attn(normed, v_residual=v_residual)
+        if bool(int(os.environ.get("PARALLEL_BLOCK", "0"))):
+            # Parallel: both attn and MLP see the same normed input
+            mlp_out = self.mlp(normed)
+        else:
+            # Sequential: MLP sees post-attn residual
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            mlp_out = self.mlp(self.mlp_norm(x) * self.ln_scale_factor)
+            return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out, v_out
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x, v_out
 
 
@@ -1075,6 +1162,10 @@ class GPT(nn.Module):
         leaky_slope: float = 0.5,
         mtp_num_heads: int = 0,
         mtp_loss_weight: float = 0.1,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
+        xsa_last_n: int = 0,
+        smear_gate: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1085,6 +1176,7 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.smear = SmearGate(model_dim) if smear_gate else None
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1100,10 +1192,17 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     leaky_slope=leaky_slope,
+                    rope_dims=rope_dims,
+                    ln_scale=ln_scale,
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
         )
+        # Enable XSA on the last N layers
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1119,14 +1218,20 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        use_ortho = bool(int(os.environ.get("ORTHO_INIT", "1")))
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+            if isinstance(module, nn.Linear) and module.weight.ndim == 2:
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                elif use_ortho:
+                    nn.init.orthogonal_(module.weight, gain=1.0)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
+        if self.smear is not None:
+            x = self.smear(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -1152,8 +1257,17 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if bool(int(os.environ.get("CLAMP_SOFTCAP", "0"))):
+            logits = logits_proj.clamp(-self.logit_softcap, self.logit_softcap)
+        else:
+            logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        # Z-loss: penalize logit magnitude to improve training stability
+        _z_loss_weight = float(os.environ.get("Z_LOSS_WEIGHT", "0.0"))
+        if self.training and _z_loss_weight > 0.0:
+            z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+            main_loss = main_loss + _z_loss_weight * z_loss
 
         # MTP: auxiliary multi-token prediction loss (discarded at export)
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
@@ -1179,6 +1293,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
+        if self.smear is not None:
+            x = self.smear(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -1197,6 +1313,8 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        if bool(int(os.environ.get("CLAMP_SOFTCAP", "0"))):
+            return logits_proj.clamp(-self.logit_softcap, self.logit_softcap)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 
@@ -1316,6 +1434,10 @@ def main() -> None:
         leaky_slope=args.leaky_slope,
         mtp_num_heads=args.mtp_num_heads,
         mtp_loss_weight=args.mtp_loss_weight,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
+        xsa_last_n=args.xsa_last_n,
+        smear_gate=args.smear_gate,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1411,11 +1533,25 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            if warmdown_start <= step < args.iterations:
+                frac = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+                if args.cosine_warmdown:
+                    return 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
+                return math.sqrt(frac) if args.sqrt_warmdown else frac
+            return 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if remaining_ms <= warmdown_ms:
+            frac = remaining_ms / max(warmdown_ms, 1e-9)
+            if args.cosine_warmdown:
+                raw = 0.5 * (1.0 + math.cos(math.pi * (1.0 - frac)))
+            elif args.sqrt_warmdown:
+                raw = math.sqrt(frac)
+            else:
+                raw = frac
+            return max(raw, args.lr_floor)
+        return 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1607,7 +1743,9 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    int6_cats_str = os.environ.get("INT6_CATS", "mlp,attn")
+    int6_cats = set(int6_cats_str.split(",")) if int6_cats_str else set()
+    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, int6_cats)
 
     # Magnitude pruning: zero out smallest quantized values to improve compression
     prune_frac = float(os.environ.get("PRUNE_FRAC", "0.0"))
@@ -1659,7 +1797,10 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    if _USE_LZMA:
+    if _USE_BROTLI and _brotli_mod is not None:
+        quant_blob = _brotli_mod.compress(quant_raw, quality=11)
+        _comp_name = "brotli"
+    elif _USE_LZMA:
         quant_blob = _lzma_mod.compress(quant_raw, format=_lzma_mod.FORMAT_ALONE, preset=9)
         _comp_name = "lzma"
     elif _COMPRESSOR == "zstd":
@@ -1680,7 +1821,9 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    if _USE_LZMA:
+    if _USE_BROTLI and _brotli_mod is not None:
+        quant_decompressed = _brotli_mod.decompress(quant_blob_disk)
+    elif _USE_LZMA:
         quant_decompressed = _lzma_mod.decompress(quant_blob_disk, format=_lzma_mod.FORMAT_ALONE)
     elif _COMPRESSOR == "zstd":
         quant_decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
