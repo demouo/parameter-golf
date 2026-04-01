@@ -94,6 +94,7 @@ class Hyperparameters:
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))  # XSA on last N layers (0 = disabled)
     smear_gate = bool(int(os.environ.get("SMEAR_GATE", "0")))  # causal shift gate in GPT forward
     vrl_mix = float(os.environ.get("VRL_MIX", 0.5))  # VRL mixing ratio (0=no VRL, 1=all first-layer V)
+    parallel_block = bool(int(os.environ.get("PARALLEL_BLOCK", "0")))  # parallel attn+mlp
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -1121,9 +1122,18 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, v_residual: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, v_out = self.attn(self.attn_norm(x) * self.ln_scale_factor, v_residual=v_residual)
+        normed = self.attn_norm(x) * self.ln_scale_factor
+        attn_out, v_out = self.attn(normed, v_residual=v_residual)
+        if bool(int(os.environ.get("PARALLEL_BLOCK", "0"))):
+            # Parallel: both attn and MLP see the same normed input
+            mlp_out = self.mlp(normed)
+        else:
+            # Sequential: MLP sees post-attn residual
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            mlp_out = self.mlp(self.mlp_norm(x) * self.ln_scale_factor)
+            return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out, v_out
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * self.ln_scale_factor)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x, v_out
 
 
